@@ -578,6 +578,8 @@ set(SLIC3R_GUI_SOURCES
     Utils/CalibUtils.hpp
     Utils/ColorSpaceConvert.cpp
     Utils/ColorSpaceConvert.hpp
+    Utils/CrealityCFS.cpp
+    Utils/CrealityCFS.hpp
     Utils/CrealityPrint.cpp
     Utils/CrealityPrint.hpp
     Utils/Duet.cpp

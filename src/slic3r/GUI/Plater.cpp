@@ -10,6 +10,9 @@
 #include <string>
 #include <regex>
 #include <future>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <boost/algorithm/string.hpp>
 #include <boost/iterator/counting_iterator.hpp>
 #include <boost/optional.hpp>
@@ -164,6 +167,8 @@
 #include "FileArchiveDialog.hpp"
 #include "../Utils/Http.hpp"
 #include "../Utils/OrcaCloudServiceAgent.hpp"
+#include "../Utils/CrealityCFS.hpp"
+#include "Widgets/HyperLink.hpp"
 #include "StepMeshDialog.hpp"
 #include "FilamentMapDialog.hpp"
 #include "CloneDialog.hpp"
@@ -463,6 +468,17 @@ struct ExtruderGroup : StaticGroup
     }
 };
 
+namespace {
+// UI-side guard tracking a colour/preset change pushed to the CFS, so an
+// in-flight inbound boxsInfo update for the same slot isn't treated as stale.
+struct CfsPendingLocalOverride
+{
+    std::string                           color;
+    std::string                           material_type;
+    std::chrono::steady_clock::time_point created_at{};
+};
+} // namespace
+
 struct Sidebar::priv
 {
     Plater *plater;
@@ -560,6 +576,22 @@ struct Sidebar::priv
     bool                    is_switching_diameter{false};
     Search::OptionsSearcher     searcher;
     std::string ams_list_device;
+
+    // Creality CFS integration state (active only on K1/K2 printers).
+    wxTimer*                          timer_cfs_sync = new wxTimer();
+    Button*                           m_bpButton_cfs_filament = nullptr;
+    HyperLink*                        m_link_cfs_config = nullptr;
+    std::vector<wxPanel*>             cfs_filament_badge_panels;
+    std::vector<Label*>               cfs_filament_badge_labels;
+    bool                              cfs_socket_connected{false};
+    bool                              cfs_auto_sync_enabled{false};
+    std::string                       cfs_socket_host;
+    std::string                       cfs_socket_origin;
+    std::shared_ptr<CrealityCFS::SocketRuntime> cfs_socket_runtime;
+    std::thread                       cfs_socket_thread;
+    size_t                            cfs_last_applied_generation{0};
+    std::unordered_set<int>           cfs_ignore_outbound_color_sync_slots;
+    std::unordered_map<int, CfsPendingLocalOverride> cfs_pending_local_overrides;
 
     priv(Plater *plater) : plater(plater) {}
     ~priv();
@@ -665,6 +697,16 @@ void Sidebar::priv::flush_printer_sync(bool restart)
 
 Sidebar::priv::~priv()
 {
+    // Guard-stop the CFS worker thread in case Sidebar::~Sidebar() did not run.
+    if (cfs_socket_runtime)
+        cfs_socket_runtime->request_stop();
+    if (cfs_socket_thread.joinable())
+        cfs_socket_thread.join();
+    if (timer_cfs_sync != nullptr) {
+        timer_cfs_sync->Stop();
+        delete timer_cfs_sync;
+        timer_cfs_sync = nullptr;
+    }
     // BBS
     //delete object_manipulation;
     delete object_settings;
@@ -2082,6 +2124,25 @@ Sidebar::Sidebar(Plater *parent)
 
     bSizer39->AddStretchSpacer(1);
 
+    // Orca: CFS sync button (shown only on supported Creality K1/K2 printers)
+    auto cfs_btn = new Button(p->m_panel_filament_title, "CFS");
+    cfs_btn->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
+    cfs_btn->SetToolTip(_L("Synchronize filament colours and presets from the Creality Filament System"));
+    cfs_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+        sync_cfs_colors();
+    });
+    p->m_bpButton_cfs_filament = cfs_btn;
+    bSizer39->Add(cfs_btn, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(4));
+    bSizer39->Hide(cfs_btn);
+
+    p->m_link_cfs_config = new HyperLink(p->scrolled, _L("Configure CFS"));
+    p->m_link_cfs_config->SetFont(Label::Body_12);
+    p->m_link_cfs_config->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent&) {
+        open_cfs_config_dialog();
+    });
+    scrolled_sizer->Add(p->m_link_cfs_config, 0, wxLEFT | wxRIGHT | wxTOP, FromDIP(8));
+    p->m_link_cfs_config->Hide();
+
     // BBS
     // add wiping dialog
     //wiping_dialog_button->SetFont(wxGetApp().normal_font());
@@ -2270,9 +2331,25 @@ Sidebar::Sidebar(Plater *parent)
     auto *sizer = new wxBoxSizer(wxVERTICAL);
     sizer->Add(p->scrolled, 1, wxEXPAND);
     SetSizer(sizer);
+
+    // Orca: initialise CFS integration (no-op on unsupported printers).
+    // refresh_cfs_sync_state() starts/stops the poll timer based on whether the
+    // selected printer supports a CFS, so it never ticks on unrelated machines.
+    p->timer_cfs_sync->Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+        handle_cfs_auto_sync_tick();
+    });
+    p->cfs_auto_sync_enabled = is_cfs_auto_sync_enabled();
+    refresh_cfs_sync_state(true);
+    update_cfs_auto_sync_ui();
 }
 
-Sidebar::~Sidebar() {}
+Sidebar::~Sidebar()
+{
+    if (p && p->timer_cfs_sync)
+        p->timer_cfs_sync->Stop();
+    if (p)
+        stop_cfs_socket_session();
+}
 
 void Sidebar::on_enter_image_printer_bed(wxMouseEvent &evt) {
     //p->image_printer_bed->Bind(wxEVT_LEAVE_WINDOW, &Sidebar::on_leave_image_printer_bed, this);
@@ -2344,6 +2421,29 @@ void Sidebar::init_filament_combo(PlaterPresetComboBox **combo, const int filame
     combo_and_btn_sizer->Add((*combo)->clr_picker, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(SidebarProps::ElementSpacing()) - FromDIP(2)); // ElementSpacing - 2 (from combo box))
     combo_and_btn_sizer->Add(*combo, 1, wxALL | wxEXPAND, FromDIP(2))->SetMinSize({-1, 30 * wxGetApp().em_unit() / 10}); // ORCA ensure height matches with PlaterPresetComboBox
 
+    // Orca: CFS sync badge overlay (shown only when CFS auto-sync is active)
+    if (static_cast<size_t>(filament_idx) >= p->cfs_filament_badge_panels.size()) {
+        p->cfs_filament_badge_panels.resize(filament_idx + 1, nullptr);
+        p->cfs_filament_badge_labels.resize(filament_idx + 1, nullptr);
+    }
+    auto* cfs_badge_panel = new wxPanel(p->m_panel_filament_content, wxID_ANY);
+    cfs_badge_panel->SetBackgroundColour(wxColour("#009688"));
+    auto* cfs_badge_sizer = new wxBoxSizer(wxHORIZONTAL);
+    auto* cfs_badge_label = new Label(cfs_badge_panel, "CFS");
+    cfs_badge_label->SetFont(Label::Body_10);
+    cfs_badge_label->SetForegroundColour(*wxWHITE);
+    cfs_badge_label->SetBackgroundColour(wxColour("#009688"));
+    cfs_badge_sizer->Add(cfs_badge_label, 0, wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, FromDIP(4));
+    cfs_badge_panel->SetSizer(cfs_badge_sizer);
+    cfs_badge_panel->Hide();
+    // Defensive: re-initialising over a populated slot must not orphan a live
+    // window (the label is a child of the panel, so destroying the panel suffices).
+    if (p->cfs_filament_badge_panels[filament_idx])
+        p->cfs_filament_badge_panels[filament_idx]->Destroy();
+    p->cfs_filament_badge_panels[filament_idx] = cfs_badge_panel;
+    p->cfs_filament_badge_labels[filament_idx] = cfs_badge_label;
+    combo_and_btn_sizer->Add(cfs_badge_panel, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(4));
+
     /* BBS hide del_btn
     ScalableButton* del_btn = new ScalableButton(p->m_panel_filament_content, wxID_ANY, "delete_filament");
     del_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent& e){
@@ -2407,6 +2507,17 @@ void Sidebar::remove_unused_filament_combos(const size_t current_extruder_count)
         sizer_filaments->Remove(last / 2);
         (*p->combos_filament[last]).Destroy();
         p->combos_filament.pop_back();
+        // CFS badges are positional decorations (no per-slot data), kept index-
+        // aligned with the combos, so dropping the tail badge here is sufficient.
+        if (last < static_cast<int>(p->cfs_filament_badge_panels.size()) && p->cfs_filament_badge_panels[last]) {
+            p->cfs_filament_badge_panels[last]->Destroy();
+            p->cfs_filament_badge_panels[last] = nullptr;
+            p->cfs_filament_badge_labels[last] = nullptr;
+        }
+        if (last < static_cast<int>(p->cfs_filament_badge_panels.size())) {
+            p->cfs_filament_badge_panels.pop_back();
+            p->cfs_filament_badge_labels.pop_back();
+        }
     }
     // BBS:  filament double columns
     auto sizer_filaments0 = this->p->sizer_filaments->GetItem((size_t)0)->GetSizer();
@@ -2887,6 +2998,8 @@ void Sidebar::msw_rescale()
     p->m_bpButton_set_filament->msw_rescale();
     p->m_flushing_volume_btn->Rescale();
     set_flushing_volume_warning(is_flush_config_modified()); // ORCA reapply appearance
+    if (p->m_bpButton_cfs_filament)
+        update_cfs_auto_sync_ui();
 
     //BBS
     p->left_extruder->Rescale();
@@ -2972,6 +3085,8 @@ void Sidebar::sys_color_changed()
     p->m_bpButton_set_filament->msw_rescale();
     p->m_flushing_volume_btn->Rescale();
     set_flushing_volume_warning(is_flush_config_modified()); // ORCA reapply appearance
+    if (p->m_bpButton_cfs_filament)
+        update_cfs_auto_sync_ui();
 
     // BBS
 #if 0
@@ -3089,6 +3204,7 @@ void Sidebar::on_filament_count_change(size_t num_filaments)
     p->m_panel_filament_title->Refresh();
     update_ui_from_settings();
     update_dynamic_filament_list();
+    update_cfs_filament_badges();
 }
 
 void Sidebar::on_filaments_delete(size_t filament_id)
@@ -3112,6 +3228,15 @@ void Sidebar::on_filaments_delete(size_t filament_id)
         PlaterPresetComboBox* to_delete_combox = p->combos_filament[filament_id];
         (*p->combos_filament[last]).Destroy();
         p->combos_filament.pop_back();
+        if (last < static_cast<int>(p->cfs_filament_badge_panels.size()) && p->cfs_filament_badge_panels[last]) {
+            p->cfs_filament_badge_panels[last]->Destroy();
+            p->cfs_filament_badge_panels[last] = nullptr;
+            p->cfs_filament_badge_labels[last] = nullptr;
+        }
+        if (last < static_cast<int>(p->cfs_filament_badge_panels.size())) {
+            p->cfs_filament_badge_panels.pop_back();
+            p->cfs_filament_badge_labels.pop_back();
+        }
 
         // BBS:  filament double columns
         auto sizer_filaments0 = this->p->sizer_filaments->GetItem((size_t) 0)->GetSizer();
@@ -3140,6 +3265,7 @@ void Sidebar::on_filaments_delete(size_t filament_id)
     p->m_panel_filament_title->Refresh();
     update_ui_from_settings();
     dynamic_filament_list.update();
+    update_cfs_filament_badges();
 }
 
 void Sidebar::add_filament() {
@@ -3434,6 +3560,700 @@ void Sidebar::load_ams_list(MachineObject* obj)
     }
 
     p->combo_printer->update();
+    refresh_cfs_sync_state(true);
+}
+
+// ---------------------------------------------------------------------------
+// Creality CFS integration (UI glue). Non-UI logic lives in Utils/CrealityCFS.
+// ---------------------------------------------------------------------------
+
+std::string Sidebar::get_cfs_socket_host() const
+{
+    const auto& cfg = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    wxString url = cfg.opt_string("print_host_webui").empty() ? cfg.opt_string("print_host") : cfg.opt_string("print_host_webui");
+    return CrealityCFS::extract_host_from_print_host(into_u8(url));
+}
+
+bool Sidebar::is_cfs_supported_printer() const
+{
+    PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+    if (!preset_bundle)
+        return false;
+
+    auto& preset = preset_bundle->printers.get_edited_preset();
+    const std::string printer_type  = preset.get_printer_type(preset_bundle);
+    const std::string printer_model = preset.config.opt_string("printer_model");
+
+    const bool has_k1 = printer_type.find("K1") != std::string::npos
+                     || printer_model.find("K1") != std::string::npos;
+    const bool has_k2 = printer_type.find("K2") != std::string::npos
+                     || printer_model.find("K2") != std::string::npos;
+    return has_k1 || has_k2;
+}
+
+std::string Sidebar::get_cfs_socket_origin() const
+{
+    const auto& cfg = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    wxString url = cfg.opt_string("print_host_webui").empty() ? cfg.opt_string("print_host") : cfg.opt_string("print_host_webui");
+    url.Trim(true);
+    url.Trim(false);
+
+    if (url.empty())
+        return {};
+
+    std::string origin = into_u8(url);
+    boost::algorithm::trim(origin);
+
+    if (!boost::algorithm::istarts_with(origin, "http://") && !boost::algorithm::istarts_with(origin, "https://"))
+        origin = "http://" + origin;
+
+    if (const auto slash_pos = origin.find('/', origin.find("://") + 3); slash_pos != std::string::npos)
+        origin = origin.substr(0, slash_pos);
+
+    return origin;
+}
+
+bool Sidebar::is_cfs_auto_sync_enabled() const
+{
+    return wxGetApp().app_config->get(CrealityCFS::kCfgAutoSync) == "1";
+}
+
+bool Sidebar::is_cfs_auto_apply_preset_enabled() const
+{
+    // Off unless explicitly enabled, so an untouched install never auto-switches presets.
+    return wxGetApp().app_config->get(CrealityCFS::kCfgAutoApplyPreset) == "1";
+}
+
+std::string Sidebar::get_cfs_preset_mapping_for_type(const std::string& material_type) const
+{
+    const std::string config_key = CrealityCFS::material_type_config_key(material_type);
+    std::string value = wxGetApp().app_config->get(config_key);
+    boost::algorithm::trim(value);
+    if (value.empty())
+        value = CrealityCFS::default_preset_mapping(material_type);
+    return value;
+}
+
+std::string Sidebar::get_cfs_material_type_for_preset(const std::string& preset_name) const
+{
+    const std::string normalized_preset_name = Preset::remove_suffix_modified(preset_name);
+    if (normalized_preset_name.empty())
+        return {};
+
+    for (const auto& material_type : CrealityCFS::supported_material_types()) {
+        const std::string mapped_preset = get_cfs_preset_mapping_for_type(material_type);
+        if (!mapped_preset.empty() && normalized_preset_name == mapped_preset)
+            return material_type;
+    }
+    return {};
+}
+
+void Sidebar::set_cfs_auto_sync_enabled(bool enabled)
+{
+    p->cfs_auto_sync_enabled = enabled;
+    wxGetApp().app_config->set(CrealityCFS::kCfgAutoSync, enabled ? "1" : "0");
+    wxGetApp().app_config->save();
+}
+
+void Sidebar::update_cfs_config_ui()
+{
+    if (!p->m_link_cfs_config)
+        return;
+    p->m_link_cfs_config->SetLabel(_L("Configure CFS"));
+    p->m_link_cfs_config->SetToolTip(_L("Choose whether CFS should also switch filament presets and which preset each type should use."));
+}
+
+void Sidebar::open_cfs_config_dialog()
+{
+    struct CfsConfigDialog : DPIDialog {
+        using DPIDialog::DPIDialog;
+        void on_dpi_changed(const wxRect&) override {}
+    };
+
+    CfsConfigDialog dlg(this, wxID_ANY, _L("CFS Settings"), wxDefaultPosition, wxDefaultSize, wxCAPTION | wxCLOSE_BOX);
+    dlg.SetBackgroundColour(*wxWHITE);
+
+    const auto collect_preset_names = []() {
+        wxArrayString choices;
+        std::unordered_set<std::string> seen;
+        const auto& presets = wxGetApp().preset_bundle->filaments.get_presets();
+        for (const auto& preset : presets) {
+            if (preset.is_default)
+                continue;
+            if (!preset.is_visible || !preset.is_compatible)
+                continue;
+            if (!seen.insert(preset.name).second)
+                continue;
+            choices.Add(from_u8(preset.name));
+        }
+        return choices;
+    };
+
+    wxArrayString preset_choices = collect_preset_names();
+    const auto material_types = CrealityCFS::supported_material_types();
+
+    auto* root = new wxBoxSizer(wxVERTICAL);
+    root->SetMinSize(wxSize(dlg.FromDIP(420), -1));
+
+    auto* desc = new Label(&dlg, Label::Body_13, _L("Configure how CFS filament types should map to Orca filament presets."));
+    desc->SetForegroundColour(StateColor::darkModeColorFor("#262E30"));
+    desc->Wrap(dlg.FromDIP(420));
+    root->Add(desc, 0, wxALL, dlg.FromDIP(12));
+
+    auto* auto_row = new wxBoxSizer(wxHORIZONTAL);
+    auto* auto_checkbox = new ::CheckBox(&dlg);
+    auto_checkbox->SetValue(is_cfs_auto_apply_preset_enabled());
+    auto* auto_label = new Label(&dlg, Label::Body_13, _L("Automatically switch filament presets"), LB_PROPAGATE_MOUSE_EVENT);
+    auto_label->Bind(wxEVT_LEFT_DOWN, [auto_checkbox](wxMouseEvent&) {
+        auto_checkbox->SetValue(!auto_checkbox->GetValue());
+    });
+    auto_row->Add(auto_checkbox, 0, wxALIGN_CENTER_VERTICAL);
+    auto_row->AddSpacer(FromDIP(6));
+    auto_row->Add(auto_label, 0, wxALIGN_CENTER_VERTICAL);
+    root->Add(auto_row, 0, wxLEFT | wxRIGHT | wxBOTTOM, dlg.FromDIP(12));
+
+    auto* scrolled = new wxScrolledWindow(&dlg, wxID_ANY, wxDefaultPosition, wxSize(-1, dlg.FromDIP(320)), wxVSCROLL);
+    scrolled->SetScrollRate(0, dlg.FromDIP(12));
+
+    auto make_mapping_row = [&dlg, scrolled, &preset_choices](const wxString& type_label, const std::string& selected_name) {
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        auto* label = new Label(scrolled, Label::Body_12, type_label);
+        label->SetForegroundColour(StateColor::darkModeColorFor("#6B6A6A"));
+        label->SetMinSize(wxSize(dlg.FromDIP(90), -1));
+        auto* combo = new ::ComboBox(scrolled, wxID_ANY, wxEmptyString, wxDefaultPosition, wxSize(dlg.FromDIP(220), -1), 0, nullptr, wxCB_READONLY);
+        for (const auto& choice : preset_choices)
+            combo->Append(choice);
+        const int selected_index = combo->FindString(from_u8(selected_name));
+        if (selected_index != wxNOT_FOUND)
+            combo->SetSelection(selected_index);
+        row->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, dlg.FromDIP(10));
+        row->Add(combo, 1, wxEXPAND);
+        return std::pair<wxBoxSizer*, ::ComboBox*>(row, combo);
+    };
+
+    auto* mappings_sizer = new wxBoxSizer(wxVERTICAL);
+    std::vector<std::pair<std::string, ::ComboBox*>> mapping_controls;
+    mapping_controls.reserve(material_types.size());
+    for (const auto& material_type : material_types) {
+        auto [row, combo] = make_mapping_row(from_u8(material_type), get_cfs_preset_mapping_for_type(material_type));
+        mappings_sizer->Add(row, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, dlg.FromDIP(10));
+        mapping_controls.emplace_back(material_type, combo);
+    }
+    scrolled->SetSizer(mappings_sizer);
+    mappings_sizer->FitInside(scrolled);
+    root->Add(scrolled, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, dlg.FromDIP(12));
+
+    const auto update_combo_state = [auto_checkbox, mapping_controls]() {
+        const bool enabled = auto_checkbox->GetValue();
+        for (const auto& [material_type, combo] : mapping_controls) {
+            (void) material_type;
+            combo->Enable(enabled);
+        }
+    };
+    update_combo_state();
+    auto_checkbox->Bind(wxEVT_TOGGLEBUTTON, [update_combo_state](wxCommandEvent&) {
+        update_combo_state();
+    });
+
+    auto* button_row = new wxBoxSizer(wxHORIZONTAL);
+    button_row->AddStretchSpacer(1);
+    auto* ok_btn = new Button(&dlg, _L("OK"));
+    ok_btn->SetStyle(ButtonStyle::Confirm, ButtonType::Choice);
+    auto* cancel_btn = new Button(&dlg, _L("Cancel"));
+    cancel_btn->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
+    button_row->Add(ok_btn, 0, wxRIGHT, dlg.FromDIP(12));
+    button_row->Add(cancel_btn, 0);
+    root->Add(button_row, 0, wxEXPAND | wxALL, dlg.FromDIP(12));
+
+    ok_btn->Bind(wxEVT_BUTTON, [&dlg](wxCommandEvent&) { dlg.EndModal(wxID_OK); });
+    cancel_btn->Bind(wxEVT_BUTTON, [&dlg](wxCommandEvent&) { dlg.EndModal(wxID_CANCEL); });
+
+    dlg.SetSizer(root);
+    dlg.Layout();
+    root->Fit(&dlg);
+    wxGetApp().UpdateDlgDarkUI(&dlg);
+
+    // Pause the poll timer for the modal loop so a tick can't mutate preset
+    // state underneath the open dialog. Restart it on every exit path.
+    const bool timer_was_running = p->timer_cfs_sync && p->timer_cfs_sync->IsRunning();
+    if (timer_was_running)
+        p->timer_cfs_sync->Stop();
+
+    const int modal_result = dlg.ShowModal();
+
+    if (modal_result == wxID_OK) {
+        wxGetApp().app_config->set(CrealityCFS::kCfgAutoApplyPreset, auto_checkbox->GetValue() ? "1" : "0");
+        for (const auto& [material_type, combo] : mapping_controls)
+            wxGetApp().app_config->set(CrealityCFS::material_type_config_key(material_type), into_u8(combo->GetValue()));
+        wxGetApp().app_config->save();
+        update_cfs_config_ui();
+    }
+
+    if (timer_was_running && p->timer_cfs_sync && !p->timer_cfs_sync->IsRunning())
+        p->timer_cfs_sync->Start(CrealityCFS::kPollIntervalMs);
+}
+
+void Sidebar::update_cfs_filament_badges()
+{
+    const bool show_badges    = p->cfs_auto_sync_enabled;
+    const bool live_connected = p->cfs_socket_runtime && p->cfs_socket_runtime->connected();
+
+    const wxColour badge_color = (p->cfs_auto_sync_enabled && !live_connected) ? wxColour("#D32F2F") : wxColour("#009688");
+    const size_t count = std::min(p->combos_filament.size(), p->cfs_filament_badge_panels.size());
+    for (size_t idx = 0; idx < count; ++idx) {
+        if (!p->cfs_filament_badge_panels[idx])
+            continue;
+        p->cfs_filament_badge_panels[idx]->SetBackgroundColour(badge_color);
+        if (idx < p->cfs_filament_badge_labels.size() && p->cfs_filament_badge_labels[idx])
+            p->cfs_filament_badge_labels[idx]->SetBackgroundColour(badge_color);
+        p->cfs_filament_badge_panels[idx]->SetToolTip(
+            live_connected
+                ? _L("CFS automatic synchronization is active for this filament.")
+                : _L("CFS automatic synchronization is active, but the printer is offline."));
+        p->cfs_filament_badge_panels[idx]->Show(show_badges);
+        p->cfs_filament_badge_panels[idx]->Refresh();
+    }
+
+    if (p->m_panel_filament_content)
+        p->m_panel_filament_content->Layout();
+    Layout();
+}
+
+void Sidebar::update_cfs_auto_sync_ui()
+{
+    const bool live_connected = p->cfs_socket_runtime && p->cfs_socket_runtime->connected();
+
+    if (p->m_bpButton_cfs_filament) {
+        auto make_state_color = [](const wxColour& disabled,
+                                   const wxColour& pressed,
+                                   const wxColour& hovered,
+                                   const wxColour& normal,
+                                   const wxColour& checked) {
+            return StateColor(
+                std::make_pair(disabled, (int) StateColor::Disabled),
+                std::make_pair(pressed, (int) StateColor::Pressed),
+                std::make_pair(pressed, (int) (StateColor::Pressed | StateColor::Checked)),
+                std::make_pair(hovered, (int) StateColor::Hovered),
+                std::make_pair(hovered, (int) (StateColor::Hovered | StateColor::Checked)),
+                std::make_pair(checked, (int) StateColor::Checked),
+                std::make_pair(normal, (int) StateColor::Normal),
+                std::make_pair(normal, (int) StateColor::Enabled));
+        };
+
+        p->m_bpButton_cfs_filament->SetLabel("CFS");
+        if (!live_connected) {
+            p->m_bpButton_cfs_filament->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
+            p->m_bpButton_cfs_filament->SetToolTip(
+                p->cfs_auto_sync_enabled
+                    ? _L("Automatic CFS synchronization is enabled, but the printer is offline.")
+                    : _L("CFS synchronization is disabled, and the printer is offline."));
+        } else if (p->cfs_auto_sync_enabled) {
+            p->m_bpButton_cfs_filament->SetStyle(ButtonStyle::Confirm, ButtonType::Compact);
+            p->m_bpButton_cfs_filament->SetToolTip(_L("Disable automatic CFS filament synchronization"));
+        } else {
+            p->m_bpButton_cfs_filament->SetStyle(ButtonStyle::Regular, ButtonType::Compact);
+            p->m_bpButton_cfs_filament->SetToolTip(_L("Enable automatic CFS filament synchronization"));
+        }
+        p->m_bpButton_cfs_filament->Rescale();
+        if (!live_connected) {
+            p->m_bpButton_cfs_filament->SetValue(false);
+            p->m_bpButton_cfs_filament->SetBackgroundColor(make_state_color(
+                wxColour("#D32F2F"), wxColour("#A91E1E"), wxColour("#E14747"), wxColour("#D32F2F"), wxColour("#D32F2F")));
+            p->m_bpButton_cfs_filament->SetBorderColor(make_state_color(
+                wxColour("#B71C1C"), wxColour("#8E1616"), wxColour("#B71C1C"), wxColour("#B71C1C"), wxColour("#B71C1C")));
+            p->m_bpButton_cfs_filament->SetTextColor(make_state_color(
+                wxColour("#FFFFFF"), wxColour("#FFFFFF"), wxColour("#FFFFFF"), wxColour("#FFFFFF"), wxColour("#FFFFFF")));
+        } else {
+            p->m_bpButton_cfs_filament->SetValue(p->cfs_auto_sync_enabled);
+        }
+        p->m_bpButton_cfs_filament->Refresh();
+        p->m_bpButton_cfs_filament->Update();
+    }
+
+    update_cfs_config_ui();
+    update_cfs_filament_badges();
+    apply_cfs_sync_button_visibility();
+}
+
+bool Sidebar::apply_cfs_colors_to_ui(const std::vector<std::string>& colors, bool force_reapply, const char* context)
+{
+    DynamicPrintConfig& project_config = wxGetApp().preset_bundle->project_config;
+    auto* color_opt = project_config.option<ConfigOptionStrings>("filament_colour");
+    if (!color_opt)
+        return false;
+
+    color_opt->values.resize(std::max(color_opt->values.size(), p->combos_filament.size()), "#26A69A");
+
+    const size_t color_count = std::min({color_opt->values.size(), p->combos_filament.size(), colors.size()});
+    if (color_count == 0)
+        return false;
+
+    size_t applied_slots = 0;
+    for (size_t idx = 0; idx < color_count; ++idx) {
+        if (colors[idx].empty() || !p->combos_filament[idx])
+            continue;
+
+        const bool changed = color_opt->values[idx] != colors[idx];
+        if (!force_reapply && !changed)
+            continue;
+
+        p->combos_filament[idx]->sync_colour_config({colors[idx]}, false);
+
+        // Mark the slot so the resulting EVT_FILAMENT_COLOR_CHANGED isn't echoed back to the CFS.
+        p->cfs_ignore_outbound_color_sync_slots.insert(static_cast<int>(idx));
+        wxCommandEvent* evt = new wxCommandEvent(EVT_FILAMENT_COLOR_CHANGED);
+        evt->SetInt(static_cast<int>(idx));
+        wxQueueEvent(wxGetApp().plater(), evt);
+
+        ++applied_slots;
+    }
+
+    if (applied_slots == 0) {
+        update_cfs_filament_badges();
+        return true;
+    }
+
+    for (size_t idx = 0; idx < color_count; ++idx) {
+        if (colors[idx].empty() || !p->combos_filament[idx])
+            continue;
+        p->combos_filament[idx]->SetToolTip(_L("Filament colour synchronized from CFS."));
+        if (wxGetApp().app_config->get("auto_calculate_flush") != "disabled")
+            auto_calc_flushing_volumes(static_cast<int>(idx));
+    }
+
+    obj_list()->update_filament_colors();
+    update_dynamic_filament_list();
+    update_ui_from_settings();
+    p->plater->update();
+    update_cfs_filament_badges();
+    BOOST_LOG_TRIVIAL(debug) << "CFS: " << context << " applied " << applied_slots << " colour slot(s)";
+    return true;
+}
+
+bool Sidebar::apply_cfs_presets_to_ui(const std::vector<std::string>& material_types, bool force_reapply, const char* context)
+{
+    if (!is_cfs_auto_apply_preset_enabled())
+        return true;
+
+    auto* preset_bundle = wxGetApp().preset_bundle;
+    auto& filament_presets = preset_bundle->filament_presets;
+    const size_t slot_count = std::min({material_types.size(), filament_presets.size(), p->combos_filament.size()});
+    if (slot_count == 0)
+        return false;
+
+    size_t applied_slots = 0;
+    for (size_t idx = 0; idx < slot_count; ++idx) {
+        const std::string target_preset = get_cfs_preset_mapping_for_type(material_types[idx]);
+        if (target_preset.empty())
+            continue;
+
+        const auto current_preset = Preset::remove_suffix_modified(filament_presets[idx]);
+        const bool changed = current_preset != target_preset;
+        if (!force_reapply && !changed)
+            continue;
+
+        if (!preset_bundle->filaments.find_preset(target_preset, false)) {
+            BOOST_LOG_TRIVIAL(debug) << "CFS: " << context << " missing preset '" << target_preset
+                                     << "' for slot " << idx << " type=" << material_types[idx];
+            continue;
+        }
+
+        preset_bundle->set_filament_preset(idx, target_preset);
+        ++applied_slots;
+    }
+
+    if (applied_slots == 0)
+        return true;
+
+    preset_bundle->export_selections(*wxGetApp().app_config);
+    wxGetApp().plater()->update_filament_colors_in_full_config();
+    for (auto* combo : p->combos_filament) {
+        if (combo)
+            combo->update();
+    }
+    update_dynamic_filament_list();
+    update_ui_from_settings();
+    p->plater->update();
+    BOOST_LOG_TRIVIAL(debug) << "CFS: " << context << " applied " << applied_slots << " preset slot(s)";
+    return true;
+}
+
+bool Sidebar::apply_cfs_materials_to_ui(const std::vector<std::string>& colors, const std::vector<std::string>& material_types, bool force_reapply, const char* context)
+{
+    const bool presets_applied = apply_cfs_presets_to_ui(material_types, force_reapply, context);
+    const bool colors_applied  = apply_cfs_colors_to_ui(colors, force_reapply, context);
+    return presets_applied || colors_applied;
+}
+
+void Sidebar::handle_cfs_auto_sync_tick()
+{
+    refresh_cfs_sync_state();
+
+    if (!p->cfs_auto_sync_enabled || !p->cfs_socket_runtime)
+        return;
+
+    const auto snap = p->cfs_socket_runtime->snapshot();
+    std::vector<std::string> colors         = snap.colors;
+    std::vector<std::string> material_types = snap.material_types;
+    const size_t             generation     = snap.generation;
+
+    const bool has_colors = std::any_of(colors.begin(), colors.end(), [](const std::string& color) { return !color.empty(); });
+    const bool has_types  = std::any_of(material_types.begin(), material_types.end(), [](const std::string& type) { return !type.empty(); });
+    if ((!has_colors && !has_types) || generation == 0 || generation == p->cfs_last_applied_generation)
+        return;
+
+    // Drop inbound slot updates that haven't yet reflected a local change we pushed.
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t idx = 0; idx < std::min(colors.size(), material_types.size()); ++idx) {
+        auto pending_it = p->cfs_pending_local_overrides.find(static_cast<int>(idx));
+        if (pending_it == p->cfs_pending_local_overrides.end())
+            continue;
+
+        if (now - pending_it->second.created_at > CrealityCFS::kRecentSuccessWindow) {
+            p->cfs_pending_local_overrides.erase(pending_it);
+            continue;
+        }
+
+        const std::string incoming_color = CrealityCFS::normalize_color(colors[idx]);
+        const std::string incoming_type  = CrealityCFS::normalize_material_type(material_types[idx]);
+        const bool color_matches = pending_it->second.color.empty() || incoming_color == pending_it->second.color;
+        const bool type_matches  = pending_it->second.material_type.empty() || incoming_type == pending_it->second.material_type;
+
+        if (color_matches && type_matches) {
+            p->cfs_pending_local_overrides.erase(pending_it);
+            continue;
+        }
+
+        colors[idx].clear();
+        material_types[idx].clear();
+    }
+
+    const bool has_filtered_colors = std::any_of(colors.begin(), colors.end(), [](const std::string& color) { return !color.empty(); });
+    const bool has_filtered_types  = std::any_of(material_types.begin(), material_types.end(), [](const std::string& type) { return !type.empty(); });
+    if (!has_filtered_colors && !has_filtered_types)
+        return;
+
+    if (apply_cfs_materials_to_ui(colors, material_types, false, "auto color sync")) {
+        p->cfs_last_applied_generation = generation;
+        update_cfs_auto_sync_ui();
+    }
+}
+
+void Sidebar::apply_cfs_sync_button_visibility()
+{
+    if (!p->m_bpButton_cfs_filament)
+        return;
+
+    const bool should_show = is_cfs_supported_printer() && (!get_cfs_socket_host().empty() || p->cfs_auto_sync_enabled);
+    if (auto* sizer = p->m_panel_filament_title ? p->m_panel_filament_title->GetSizer() : nullptr)
+        sizer->Show(p->m_bpButton_cfs_filament, should_show);
+    else
+        p->m_bpButton_cfs_filament->Show(should_show);
+
+    if (p->m_link_cfs_config)
+        p->m_link_cfs_config->Show(should_show);
+
+    if (p->m_panel_filament_title)
+        p->m_panel_filament_title->Layout();
+    if (p->m_link_cfs_config && p->m_link_cfs_config->GetContainingSizer())
+        p->m_link_cfs_config->GetContainingSizer()->Layout();
+    Layout();
+}
+
+void Sidebar::start_cfs_socket_session(const std::string& host, const std::string& origin)
+{
+    stop_cfs_socket_session();
+
+    auto runtime = std::make_shared<CrealityCFS::SocketRuntime>(host, origin);
+    runtime->request_boxs_info();
+
+    p->cfs_socket_host    = host;
+    p->cfs_socket_origin  = origin;
+    p->cfs_socket_runtime = runtime;
+    p->cfs_socket_thread  = std::thread([runtime]() { runtime->run(); });
+    BOOST_LOG_TRIVIAL(debug) << "CFS socket: started persistent session for '" << host << "'";
+}
+
+void Sidebar::stop_cfs_socket_session()
+{
+    if (p->cfs_socket_runtime)
+        p->cfs_socket_runtime->request_stop();
+    if (p->cfs_socket_thread.joinable())
+        p->cfs_socket_thread.join();
+    p->cfs_socket_runtime.reset();
+
+    p->cfs_socket_host.clear();
+    p->cfs_socket_origin.clear();
+    p->cfs_socket_connected = false;
+    p->cfs_last_applied_generation = 0;
+    p->cfs_ignore_outbound_color_sync_slots.clear();
+    p->cfs_pending_local_overrides.clear();
+}
+
+void Sidebar::request_cfs_boxs_info()
+{
+    if (p->cfs_socket_runtime)
+        p->cfs_socket_runtime->request_boxs_info();
+}
+
+void Sidebar::queue_cfs_color_push(int filament_idx)
+{
+    if (filament_idx < 0)
+        return;
+
+    if (p->cfs_ignore_outbound_color_sync_slots.erase(filament_idx) > 0)
+        return; // change originated from a CFS sync; don't echo it back
+
+    if (!p->cfs_auto_sync_enabled || !p->cfs_socket_runtime)
+        return;
+
+    auto* color_opt = wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+    if (!color_opt || filament_idx >= static_cast<int>(color_opt->values.size()))
+        return;
+
+    const std::string color = CrealityCFS::normalize_color(color_opt->values[filament_idx]);
+    if (color.empty())
+        return;
+
+    if (!p->cfs_socket_runtime->queue_modify_material(static_cast<size_t>(filament_idx), color))
+        return;
+
+    p->cfs_pending_local_overrides[filament_idx] = CfsPendingLocalOverride{color, {}, std::chrono::steady_clock::now()};
+}
+
+void Sidebar::queue_cfs_preset_push(int filament_idx)
+{
+    if (filament_idx < 0)
+        return;
+    if (!p->cfs_auto_sync_enabled || !is_cfs_auto_apply_preset_enabled() || !p->cfs_socket_runtime)
+        return;
+
+    auto& filament_presets = wxGetApp().preset_bundle->filament_presets;
+    if (filament_idx >= static_cast<int>(filament_presets.size()))
+        return;
+
+    const std::string preset_name   = Preset::remove_suffix_modified(filament_presets[filament_idx]);
+    const std::string material_type = get_cfs_material_type_for_preset(preset_name);
+    if (material_type.empty())
+        return;
+
+    const auto* preset_definition = CrealityCFS::find_material_preset_definition(material_type);
+    if (!preset_definition)
+        return;
+
+    auto* color_opt = wxGetApp().preset_bundle->project_config.option<ConfigOptionStrings>("filament_colour");
+    std::string color = color_opt && filament_idx < static_cast<int>(color_opt->values.size())
+        ? CrealityCFS::normalize_color(color_opt->values[filament_idx])
+        : std::string{};
+
+    CrealityCFS::SlotMaterial slot_material;
+    if (!p->cfs_socket_runtime->slot_material(static_cast<size_t>(filament_idx), slot_material))
+        return;
+    if (slot_material.material_id < 0)
+        return;
+
+    if (color.empty())
+        color = CrealityCFS::normalize_color(slot_material.color);
+    if (color.empty())
+        color = "#000000";
+
+    json payload = {
+        {"boxId",    slot_material.box_id},
+        {"id",       slot_material.material_id},
+        {"rfid",     std::string(preset_definition->rfid)},
+        {"type",     std::string(preset_definition->type)},
+        {"vendor",   std::string(preset_definition->vendor)},
+        {"name",     std::string(preset_definition->name)},
+        {"color",    CrealityCFS::encode_printer_color(color)},
+        {"minTemp",  std::string(preset_definition->temp_min)},
+        {"maxTemp",  std::string(preset_definition->temp_max)},
+        {"pressure", std::string(preset_definition->pressure)}
+    };
+    if (!p->cfs_socket_runtime->queue_modify_material_payload(std::move(payload)))
+        return;
+
+    p->cfs_pending_local_overrides[filament_idx] = CfsPendingLocalOverride{color, material_type, std::chrono::steady_clock::now()};
+}
+
+void Sidebar::refresh_cfs_sync_state(bool force_probe)
+{
+    if (!is_cfs_supported_printer()) {
+        stop_cfs_socket_session();
+        if (p->timer_cfs_sync)
+            p->timer_cfs_sync->Stop();
+        if (p->m_bpButton_cfs_filament)
+            p->m_bpButton_cfs_filament->Hide();
+        if (p->m_link_cfs_config)
+            p->m_link_cfs_config->Hide();
+        return;
+    }
+
+    // Supported printer: keep the poll timer running so snapshots are applied.
+    if (p->timer_cfs_sync && !p->timer_cfs_sync->IsRunning())
+        p->timer_cfs_sync->Start(CrealityCFS::kPollIntervalMs);
+
+    const auto host   = get_cfs_socket_host();
+    const auto origin = get_cfs_socket_origin();
+    if (host.empty()) {
+        stop_cfs_socket_session();
+        apply_cfs_sync_button_visibility();
+        return;
+    }
+
+    const bool host_changed = host != p->cfs_socket_host || origin != p->cfs_socket_origin;
+    if (!p->cfs_socket_runtime || host_changed) {
+        start_cfs_socket_session(host, origin);
+    } else if (force_probe) {
+        request_cfs_boxs_info();
+    }
+
+    if (p->cfs_socket_runtime) {
+        const auto snap = p->cfs_socket_runtime->snapshot();
+        const bool recent_success =
+            snap.has_recent_success &&
+            (std::chrono::steady_clock::now() - snap.last_success_at) < CrealityCFS::kRecentSuccessWindow;
+        p->cfs_socket_connected = snap.connected || recent_success;
+    } else {
+        p->cfs_socket_connected = false;
+    }
+    update_cfs_auto_sync_ui();
+}
+
+bool Sidebar::sync_cfs_colors()
+{
+    // Toggle off if already enabled.
+    if (p->cfs_auto_sync_enabled) {
+        set_cfs_auto_sync_enabled(false);
+        update_cfs_auto_sync_ui();
+        return true;
+    }
+
+    const auto host = get_cfs_socket_host();
+    if (host.empty()) {
+        MessageDialog dlg(this, _L("Set a printer host before synchronizing CFS colours."), _L("Sync filament colours"), wxOK);
+        dlg.ShowModal();
+        return false;
+    }
+
+    // Enable auto-sync and kick a probe; the timer tick applies colours as soon as
+    // the CFS responds, so the UI thread never blocks waiting on the socket.
+    set_cfs_auto_sync_enabled(true);
+    refresh_cfs_sync_state(true);
+    request_cfs_boxs_info();
+
+    // If a snapshot is already cached (warm session), apply it immediately.
+    if (p->cfs_socket_runtime) {
+        const auto snap = p->cfs_socket_runtime->snapshot();
+        const bool has_colors = std::any_of(snap.colors.begin(), snap.colors.end(), [](const std::string& c) { return !c.empty(); });
+        const bool has_types  = std::any_of(snap.material_types.begin(), snap.material_types.end(), [](const std::string& t) { return !t.empty(); });
+        if (snap.generation != 0 && (has_colors || has_types)
+            && apply_cfs_materials_to_ui(snap.colors, snap.material_types, true, "manual color sync")) {
+            p->cfs_last_applied_generation = snap.generation;
+        }
+    }
+
+    update_cfs_auto_sync_ui();
+    return true;
 }
 
 void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
@@ -3712,6 +4532,7 @@ void Sidebar::show_SEMM_buttons()
             c->edit_btn->SetBitmap_("edit");
     }
 
+    apply_cfs_sync_button_visibility();
     Layout();
 }
 
@@ -3955,6 +4776,7 @@ void Sidebar::update_ui_from_settings()
 #if 0
     p->object_list->apply_volumes_order();
 #endif
+    refresh_cfs_sync_state();
 }
 
 bool Sidebar::show_object_list(bool show) const
@@ -10400,6 +11222,8 @@ void Plater::priv::on_filament_color_changed(wxCommandEvent &event)
     if (wxGetApp().app_config->get("auto_calculate_flush") != "disabled") {
         sidebar->auto_calc_flushing_volumes(modify_id);
     }
+
+    sidebar->queue_cfs_color_push(modify_id);
 }
 
 void Plater::priv::install_network_plugin(wxCommandEvent &event)
@@ -16448,6 +17272,7 @@ void Plater::on_filament_change(size_t filament_idx)
     if (filament == nullptr)
         return;
     std::string filament_type = filament->config.option<ConfigOptionStrings>("filament_type")->values[0];
+    sidebar().queue_cfs_preset_push(static_cast<int>(filament_idx));
 }
 
 // BBS.
